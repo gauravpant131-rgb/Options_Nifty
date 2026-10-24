@@ -3,4 +3,5 @@ yfinance
 numpy
 pandas
 plotly
-kiteconnect
+growwapi
+pyotp

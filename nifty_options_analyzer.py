@@ -2,7 +2,7 @@
 Nifty Options Payoff Analyzer  (EDUCATIONAL USE ONLY - not investment advice)
 
 Run:
-    pip install streamlit yfinance numpy pandas plotly kiteconnect
+    pip install streamlit yfinance numpy pandas plotly growwapi pyotp
     streamlit run nifty_options_analyzer.py
 """
 import math
@@ -11,12 +11,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from datetime import date
+from datetime import date, timedelta
 
 try:
-    from kiteconnect import KiteConnect
+    from growwapi import GrowwAPI
 except ImportError:
-    KiteConnect = None
+    GrowwAPI = None
 
 st.set_page_config(page_title="Nifty Options Analyzer", layout="wide")
 st.title("📈 Nifty Options Payoff Analyzer")
@@ -33,12 +33,18 @@ def get_spot(symbol):
         return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def nfo_options(api_key, token):
-    k = KiteConnect(api_key=api_key)
-    k.set_access_token(token)
-    df = pd.DataFrame(k.instruments("NFO"))
-    return df[df.instrument_type.isin(["CE", "PE"])]
+@st.cache_data(ttl=30, show_spinner=False)
+def groww_chain(_g, underlying, expiry_iso):
+    """Option chain (LTP + IV per strike) from Groww Trade API."""
+    resp = _g.get_option_chain(exchange=_g.EXCHANGE_NSE, underlying=underlying, expiry_date=expiry_iso)
+    chain = {}
+    for k, v in resp.get("strikes", {}).items():
+        for t in ("CE", "PE"):
+            leg = v.get(t)
+            if leg and leg.get("ltp") is not None:
+                chain[(t, float(k))] = dict(ltp=float(leg["ltp"]), iv=(leg.get("greeks") or {}).get("iv"),
+                                            sym=leg.get("trading_symbol"))
+    return resp.get("underlying_ltp"), chain
 
 
 # ---------- pricing ----------
@@ -65,83 +71,64 @@ def bs_price(S, K, T, r, iv, kind):
 with st.sidebar:
     st.header("Market inputs")
     symbol = st.selectbox("Index", ["^NSEI", "^NSEBANK"], format_func=lambda x: "NIFTY 50" if x == "^NSEI" else "BANK NIFTY")
-    # ---- Zerodha Kite (optional, read-only: quotes + margin; no order placement) ----
-    with st.expander("🔌 Zerodha Kite (optional)"):
-        if KiteConnect is None:
-            st.warning("Run: pip install kiteconnect")
+    # ---- Groww Trade API (optional, read-only: quotes + margin; no order placement) ----
+    with st.expander("🔌 Groww Trade API (optional)"):
+        if GrowwAPI is None:
+            st.warning("Run: pip install growwapi pyotp")
         else:
-            api_key = st.text_input("API key", key="k_api")
-            if api_key:
-                api_secret = st.text_input("API secret", type="password", key="k_sec")
-                st.markdown(f"1. [Login to Kite]({KiteConnect(api_key=api_key).login_url()}) → copy `request_token` from the redirect URL")
-                req = st.text_input("2. request_token", key="k_req")
-                if st.button("Generate session") and req and api_secret:
-                    try:
-                        k = KiteConnect(api_key=api_key)
-                        tok = k.generate_session(req, api_secret=api_secret)["access_token"]
-                        k.set_access_token(tok)
-                        st.session_state.update(kite=k, kite_key=api_key, kite_tok=tok)
-                        st.success("Connected (token valid for today only)")
-                    except Exception as e:
-                        st.error(f"Login failed: {e}")
-                tok_in = st.text_input("...or paste today's access_token", type="password", key="k_tok")
-                if tok_in and st.button("Connect with token"):
-                    k = KiteConnect(api_key=api_key)
-                    k.set_access_token(tok_in)
-                    st.session_state.update(kite=k, kite_key=api_key, kite_tok=tok_in)
+            mode = st.radio("Login method", ["API key + secret (daily approval)", "TOTP token + secret (no expiry)"])
+            gk = st.text_input("API key / TOTP token", type="password")
+            gs = st.text_input("API secret / TOTP secret", type="password")
+            if st.button("Connect") and gk and gs:
+                try:
+                    if mode.startswith("API"):
+                        tok = GrowwAPI.get_access_token(api_key=gk, secret=gs)
+                    else:
+                        import pyotp
+                        tok = GrowwAPI.get_access_token(api_key=gk, totp=pyotp.TOTP(gs).now())
+                    st.session_state.groww = GrowwAPI(tok)
                     st.success("Connected")
-        st.caption("Keys stay in this session only. Never hard-code or share them.")
+                except Exception as e:
+                    st.error(f"Login failed: {e}")
+        st.caption("Needs an active Groww Trading API subscription. Keys stay in this session only; never hard-code or share them.")
 
-    kite = st.session_state.get("kite")
-    kname = "NIFTY" if symbol == "^NSEI" else "BANKNIFTY"
-    inst, expiry = None, None
-    live = None
-    if kite:
+    groww = st.session_state.get("groww")
+    gname = "NIFTY" if symbol == "^NSEI" else "BANKNIFTY"
+    chain, expiry, live, iv_default = {}, None, None, 14.0
+    if groww:
+        today = date.today()
+        expiry = st.date_input("Expiry date", value=today + timedelta((1 - today.weekday()) % 7))
         try:
-            inst = nfo_options(st.session_state.kite_key, st.session_state.kite_tok)
-            inst = inst[inst["name"] == kname]
-            expiry = st.selectbox("Expiry", sorted(inst.expiry.unique()))
-            kq = "NSE:NIFTY 50" if kname == "NIFTY" else "NSE:NIFTY BANK"
-            live = kite.ltp([kq])[kq]["last_price"]
+            live, chain = groww_chain(groww, gname, expiry.isoformat())
+            if not chain:
+                st.warning("No contracts for this expiry - pick a valid expiry date.")
+            else:
+                near = min({k for _, k in chain}, key=lambda k: abs(k - (live or 0)))
+                ivs = [chain[(t, near)]["iv"] for t in ("CE", "PE") if (t, near) in chain and chain[(t, near)]["iv"]]
+                if ivs:
+                    iv_default = sum(ivs) / len(ivs)
         except Exception as e:
-            st.error(f"Kite error (token expired?): {e}")
-            kite, inst, expiry = None, None, None
+            st.error(f"Groww error (token expired / no subscription?): {e}")
+            groww, chain = None, {}
     if live is None:
         live = get_spot(symbol)
     spot = st.number_input("Spot price", value=float(round(live, 2)) if live else 24500.0, step=50.0)
     if live is None:
         st.warning("Spot fetch failed - enter manually.")
-    default_lot = int(inst.lot_size.iloc[0]) if inst is not None and len(inst) else (65 if symbol == "^NSEI" else 30)
-    lot = st.number_input("Lot size" + (" (from Kite)" if inst is not None else " (verify on NSE)"), value=default_lot, step=1)
+    default_lot = 65 if symbol == "^NSEI" else 30
+    lot = st.number_input("Lot size (verify on NSE)", value=default_lot, step=1)
     if expiry is not None:
         dte = max((expiry - date.today()).days, 0)
         st.caption(f"Days to expiry: {dte}")
     else:
         dte = st.number_input("Days to expiry", value=7, min_value=0, step=1)
-    iv = st.number_input("Implied volatility %", value=14.0, step=0.5) / 100
+    iv = st.number_input("Implied volatility %" + (" (ATM, from Groww)" if chain else ""), value=float(round(iv_default, 1)), step=0.5) / 100
     rate = st.number_input("Risk-free rate %", value=6.5, step=0.25) / 100
     margin_pct = st.number_input("Naked-short margin % of notional (approx)", value=12.0, step=1.0) / 100
 
 # ---------- strategy presets ----------
 atm = round(spot / 50) * 50
 step = 50 if symbol == "^NSEI" else 100
-
-
-def kite_symbol(kind, strike):
-    if inst is None or expiry is None:
-        return None
-    m = inst[(inst.expiry == expiry) & (inst.instrument_type == kind) & (inst.strike == float(strike))]
-    return m.tradingsymbol.iloc[0] if len(m) else None
-
-
-def kite_ltps(pairs):
-    """pairs: list of (type, strike) -> {(type, strike): ltp}"""
-    syms = {p: kite_symbol(*p) for p in pairs}
-    keys = [f"NFO:{v}" for v in syms.values() if v]
-    if not (kite and keys):
-        return {}
-    q = kite.ltp(keys)
-    return {p: q[f"NFO:{v}"]["last_price"] for p, v in syms.items() if v and f"NFO:{v}" in q}
 
 
 def preset(name):
@@ -160,10 +147,7 @@ def preset(name):
                            ("CE", "Sell", a, 1), ("CE", "Buy", a + 3 * step, 1)],
     }
     rows = []
-    try:
-        live_p = kite_ltps([(t, k) for t, _, k, _ in P[name]]) if kite and P[name] else {}
-    except Exception:
-        live_p = {}
+    live_p = {(t, k): chain[(t, float(k))]["ltp"] for t, _, k, _ in P[name] if (t, float(k)) in chain}
     for t, act, k, q in P[name]:
         prem = live_p.get((t, k)) or float(bs_price(spot, k, dte / 365, rate, iv, t))
         rows.append({"Type": t, "Action": act, "Strike": float(k), "Premium": round(prem, 2), "Lots": q})
@@ -173,7 +157,7 @@ def preset(name):
 name = st.selectbox("Strategy template (premiums auto-filled with Black-Scholes at your IV)",
                     ["Iron Condor", "Custom", "Long Straddle", "Short Straddle", "Long Strangle",
                      "Short Strangle", "Bull Call Spread", "Bear Put Spread", "Iron Butterfly"])
-st.write("**Legs** - edit freely. Premiums are live Kite LTPs when connected, otherwise Black-Scholes estimates:")
+st.write("**Legs** - edit freely. Premiums are live Groww LTPs when connected, otherwise Black-Scholes estimates:")
 st.session_state.setdefault("ver", 0)
 if st.session_state.get("ov_name") != name:
     st.session_state.pop("override", None)
@@ -189,16 +173,16 @@ legs = st.data_editor(
         "Lots": st.column_config.NumberColumn(min_value=1, step=1, default=1, required=True),
     })
 legs = legs.dropna()
-if kite and expiry is not None and not legs.empty:
-    if st.button("🔄 Refresh LTPs from Kite for these legs"):
-        try:
-            got = kite_ltps([(r.Type, r.Strike) for r in legs.itertuples()])
-            new = legs.copy()
-            new["Premium"] = [got.get((r.Type, r.Strike), r.Premium) for r in legs.itertuples()]
-            st.session_state.update(override=new, ov_name=name, ver=st.session_state.ver + 1)
-            st.rerun()
-        except Exception as e:
-            st.error(f"Could not fetch quotes: {e}")
+if chain and not legs.empty:
+    if st.button("🔄 Refresh LTPs from Groww"):
+        groww_chain.clear()
+        st.session_state.pending = True
+        st.rerun()
+    if st.session_state.pop("pending", False):
+        new = legs.copy()
+        new["Premium"] = [chain.get((r.Type, float(r.Strike)), {}).get("ltp", r.Premium) for r in legs.itertuples()]
+        st.session_state.update(override=new, ov_name=name, ver=st.session_state.ver + 1)
+        st.rerun()
 if legs.empty:
     st.info("Add at least one leg.")
     st.stop()
@@ -265,25 +249,27 @@ c3.metric("Break-even(s)", ", ".join(f"{b:,.0f}" for b in bes) if bes else "None
 c4.metric("Est. margin required", f"₹{margin:,.0f}" if np.isfinite(margin) else "n/a")
 st.caption(f"Net {'credit' if net_credit >= 0 else 'debit'}: ₹{abs(net_credit):,.0f}  |  {margin_note}")
 
-# ---------- real margin from Zerodha ----------
-if kite and expiry is not None:
-    if st.button("🏦 Get actual margin from Zerodha"):
-        orders = []
+# ---------- real margin from Groww ----------
+if groww and chain:
+    if st.button("🏦 Get actual margin from Groww"):
+        orders, ok = [], True
         for l in legs.itertuples():
-            sym = kite_symbol(l.Type, l.Strike)
-            if not sym:
+            c = chain.get((l.Type, float(l.Strike)))
+            if not c:
                 st.error(f"No contract found for {l.Type} {l.Strike:.0f} on {expiry}.")
+                ok = False
                 break
-            orders.append(dict(exchange="NFO", tradingsymbol=sym, variety="regular", product="NRML",
-                               order_type="MARKET", transaction_type="BUY" if l.Action == "Buy" else "SELL",
-                               quantity=int(l.Lots * lot)))
-        else:
+            orders.append(dict(trading_symbol=c["sym"], transaction_type=getattr(groww, "TRANSACTION_TYPE_BUY" if l.Action == "Buy" else "TRANSACTION_TYPE_SELL"),
+                               quantity=int(l.Lots * lot), price=float(l.Premium), order_type=groww.ORDER_TYPE_LIMIT,
+                               product=getattr(groww, "PRODUCT_NRML", "NRML"), exchange=groww.EXCHANGE_NSE))
+        if ok:
             try:
-                r = kite.basket_order_margins(orders, consider_positions=False)
-                m1, m2 = st.columns(2)
-                m1.metric("Margin without hedge benefit", f"₹{r['initial']['total']:,.0f}")
-                m2.metric("Required margin (with hedge benefit)", f"₹{r['final']['total']:,.0f}")
-                st.caption("From Zerodha's margin API. Treat as indicative - verify on Kite before trading, especially in high-VIX periods.")
+                r = groww.get_order_margin_details(segment=groww.SEGMENT_FNO, orders=orders)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total requirement", f"₹{r.get('total_requirement', 0):,.0f}")
+                m2.metric("SPAN", f"₹{r.get('span_required', 0):,.0f}")
+                m3.metric("Exposure", f"₹{r.get('exposure_required', 0):,.0f}")
+                st.caption("From Groww's margin API (includes brokerage/charges and any premium for bought options). Verify in the Groww app before trading.")
             except Exception as e:
                 st.error(f"Margin API error: {e}")
 
@@ -318,7 +304,7 @@ st.metric("Approx. probability of profit (lognormal model)", f"{pop:.1f}%")
 
 with st.expander("Limitations - please read"):
     st.markdown("""
-- **Without Kite:** yfinance gives index spot only, so premiums are Black-Scholes estimates. With Kite connected, premiums, lot size, expiries and margin come from Zerodha.
+- **Without Groww:** yfinance gives index spot only, so premiums are Black-Scholes estimates. With Groww connected, option premiums, ATM implied volatility and margin come from Groww.
 - **This tool never places orders.** It is read-only analysis.
 - **Margin is a rough estimate.** Real margin uses NSE SPAN + exposure; use your broker's margin calculator for actual numbers.
 - **No tool can guarantee "maximising profit".** Probability of profit is model-based (assumes lognormal returns, constant IV) and ignores fees, STT, slippage and gaps.
